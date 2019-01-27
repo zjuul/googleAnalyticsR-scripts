@@ -1,0 +1,228 @@
+---
+title: "Analytics Checkup"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE, echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo=FALSE, cache=TRUE, error=TRUE, message=FALSE, warning = FALSE, fig.width=10)
+
+options(scipen = 666)
+
+# google analytics libs
+library(googleAnalyticsR)
+library(googleAuthR)
+
+library(skimr)      # for summary table
+library(knitr)      # to kable
+library(kableExtra) # nice kables
+library(tidyverse)  # data wrangling
+library(viridis)    # colors
+library(glue)       # paste++
+library(lubridate)  # date funcs
+library(gridExtra)  # line up graphs
+
+customer <- 'Customer Name'
+accountid <- '1110000'       # ga account id
+property <- 'UA-1110000-3'   # ga property id
+viewid <- '4010100'          # ga view id
+
+# authenticate - interactive. Tip: use a service account + json file
+gar_auth()
+
+# look back 28 days
+from_date <- Sys.Date() - 28 
+to_date   <- Sys.Date() - 1
+date_range <- c(as.character(from_date), as.character(to_date))
+
+basic_metrics <- c("users", "sessions", "pageViews", "totalEvents", "transactions",
+                   "transactionRevenue", "bounceRate", "goalCompletionsAll")
+   
+basics <-  google_analytics(viewid, date_range = date_range,
+                                    dimensions = c("date"), metrics = basic_metrics)
+
+cdims <- ga_custom_vars_list(accountid, property, type = "customDimensions")
+cmets <- ga_custom_vars_list(accountid, property, type = "customMetrics")
+
+```
+
+This is an automatically generated document, generated on `r Sys.Date()` - for view `r viewid` - **`r customer`**
+
+Used date range is `r from_date` to `r to_date`
+
+## Eyeball Check
+
+Checking some basic metrics to see how it looks.
+
+```{r}
+
+plot_metric_by_day <- function(metric) {
+  ggplot(basics, aes(x = date, color = "value")) +
+    geom_line(aes_string(y = metric)) +
+    theme_minimal() + xlab("") + ylab("value") +
+    ggtitle(glue("28 day trend of {metric}")) +
+    theme(plot.title = element_text(size = 10)) +
+    scale_color_viridis(discrete = TRUE) + theme(legend.position = "none")
+    
+}
+
+plotlist <- list()
+for (m in basic_metrics) {
+  plotlist[[m]] <- plot_metric_by_day(m)
+}
+
+# arrange plots in a grid
+do.call("grid.arrange", c(plotlist, ncol=floor(sqrt(length(plotlist)))))
+
+```
+
+Showing a summary and percentiles:
+
+```{r echo=FALSE}
+
+
+skim_to_wide(basics[2:ncol(basics)]) %>%
+  select(variable, mean, sd, p0, p50, p100, hist)
+
+```
+
+## Custom Dimensions and Metrics
+
+`r customer` has configured `r ifelse(is.null(nrow(cmets$items)),0,nrow(cmets$items))` custom metrics and
+`r ifelse(is.null(nrow(cdims$items)),0,nrow(cdims$items))` dimensions.
+
+```{r} 
+
+show_custom_vars <- function(x) {
+  if (!is.null(nrow(x$items))) {
+    type <- gsub('.*#custom', '', x$kind )
+    df <- x$items[,c("index", "name", "scope", "active")] 
+    
+    # display table + add styling
+    kable(df %>% 
+            mutate(active = cell_spec(active, color = ifelse(!is.na(active), "green", "red"))),
+          escape = FALSE,
+          caption = glue("Custom {type} list for {customer}")) %>% 
+      kable_styling(bootstrap_options = c("striped", "condensed", full_width=FALSE))
+  }
+}
+
+show_custom_vars(cdims)
+show_custom_vars(cmets)
+
+```
+
+### Custom Dim values
+
+Here's a summary of the Custom Dimensions, and the number of values found:
+
+```{r message=FALSE, warning = FALSE}
+
+call_ga <- function(index = 1, n = 100, active = TRUE, name = "(no name)", id = viewid, dates = date_range) {
+  
+  # returns a list of 2:
+  # summary = 1-row df with summary
+  # results = df of results (top 10)
+  
+  ret <- list(
+    summary = data.frame(
+      index = index,
+      name = name,
+      active = active,
+      rows_queried = 0,
+      rows_found = 0
+    ),
+    results = data.frame()
+  )
+  
+  if (!is.na(active) && active == TRUE) {
+    df <- google_analytics(viewId = id, date_range = dates,
+                           dimensions = c(glue("dimension{index}")),
+                           metrics=c("users"),
+                           order = order_type("users", sort_order = c("DESCENDING")),
+                             max = n)
+    ret <- list(
+      summary = data.frame(
+        index = index,
+        name = name,
+        active = active,
+        rows_queried = n,
+        rows_found = ifelse(is.null(nrow(df)),0,nrow(df))
+      ),
+      results = head(df,10)
+    )
+  }
+  
+  # return something
+  ret
+}
+
+get_custom_vars <- function(x) {
+  # input: cdims or cmets
+  # output: list of 2 data frames:
+  # 1: summary df
+  # 2: value df of all dims/metrics
+  
+  dim_table <- data.frame()
+  res_table <- data.frame()
+      
+  if (!is.null(nrow(x$items))) {
+    type <- gsub('.*#custom', '', x$kind )
+    df <- x$items[,c("index", "name", "scope", "active")] 
+    
+    if (type == "Dimensions") {
+
+      # populate tables
+      for (d in 1:nrow(df)) {
+        c <- call_ga(index  = df[d,"index"],
+                     active = df[d,"active"],
+                     name   = df[d,"name"])
+        dim_table <- rbind(dim_table, c$summary)
+        
+        if (length(c$results) > 0) {
+          thistop10 <- c$results
+          colnames(thistop10) <- c("dimension","users")
+        } else {
+          thistop10 <- data.frame(dimension = "(no result)", users = as.numeric(NA))
+        }
+        
+        thistop10$name <- df[d,"name"]
+        thistop10$index <- df[d,"index"]
+        
+        res_table <- rbind(res_table, thistop10)
+      }
+
+    } else {
+      message("no custom metric support yet")
+    }
+  }
+  
+  list(summary_df = dim_table, content_df = res_table)
+}
+
+fetched_dims <- get_custom_vars(cdims)
+
+# print table, add styling
+kable(fetched_dims[["summary_df"]],
+      escape = FALSE,
+      caption = glue("Custom Dim summary for {customer}")) %>% 
+  row_spec(which(fetched_dims[["summary_df"]]$rows_found == 0), color = "red") %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+
+```
+
+### Top 10 values per dimension
+
+A long table, with the top 10 values of each dimension and the number of users per said value.
+
+```{r}
+
+df <- fetched_dims[["content_df"]] %>% select(index, name, dimension, users) %>% filter(!is.na(users))
+
+kable(df,
+      escape = FALSE,
+      caption = glue("Custom Dim summary for {customer}")) %>% 
+  row_spec(which(df$index %% 2 == 0), background = "#eeeeee") %>% 
+  kable_styling(bootstrap_options = c("condensed"))
+
+```
